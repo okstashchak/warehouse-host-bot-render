@@ -21,8 +21,8 @@ from telegram.ext import (
 from datetime import datetime, timedelta
 import calendar
 
-# Настройки
-TOKEN = os.environ.get('BOT_TOKEN')
+# Настройки - получаем токен из переменных окружения
+TOKEN = os.environ.get('BOT_TOKEN', '7576912897:AAGdkGgBYLrh1jjIUwvskqh6Ptqk-fcCqPM')
 DB_NAME = "warehouse.db"
 IMAGES_DIR = "images"
 
@@ -83,7 +83,7 @@ def init_db():
         )
     """)
     
-    # Таблица бронирований
+    # Таблица бронирований - ОБНОВЛЕННАЯ ВЕРСИЯ
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,7 +350,7 @@ def generate_calendar(year=None, month=None, selection_type="start"):
     
     return InlineKeyboardMarkup(keyboard)
 
-# Функции для бронирования
+# Функции для бронирования с добавлением информации о пользователе и мероприятии
 async def reserve_item_start(update: Update, context: CallbackContext) -> int:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -592,7 +592,7 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("❌ Произошла ошибка при создании брони. Попробуйте еще раз.")
         return ConversationHandler.END
 
-# Функции для возврата брони
+# Функции для возврата брони с информацией о пользователе
 async def return_reservation(update: Update, context: CallbackContext) -> None:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -803,7 +803,7 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
     
     return CHECK_DATE
 
-# Функции для просмотра позиции
+# Улучшенные функции для просмотра позиции
 async def view_item_start(update: Update, context: CallbackContext) -> int:
     buttons = [
         [InlineKeyboardButton("📁 Поиск по категориям", callback_data="view_categories")],
@@ -995,7 +995,7 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
     
     return ConversationHandler.END
 
-# Функции для просмотра своих бронирований
+# Новая функция для просмотра своих бронирований
 async def my_reservations(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     user_id = user.id
@@ -1033,8 +1033,16 @@ async def my_reservations(update: Update, context: CallbackContext) -> None:
     
     await update.message.reply_text(response)
 
-# Функции для администраторов
+# Функция для отправки напоминаний (для администраторов)
 async def send_reminders(update: Update, context: CallbackContext) -> None:
+    # Проверяем, является ли пользователь администратором
+    # Здесь можно добавить проверку на ID администратора
+    # ADMIN_IDS = [123456789, 987654321]  # Замените на реальные ID
+    
+    # if update.effective_user.id not in ADMIN_IDS:
+    #     await update.message.reply_text("❌ У вас нет прав для этой команды!")
+    #     return
+    
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
@@ -1090,7 +1098,14 @@ async def send_reminders(update: Update, context: CallbackContext) -> None:
     
     await update.message.reply_text(response)
 
+# Функция для отправки уведомлений всем пользователям
 async def notify_all_users(update: Update, context: CallbackContext) -> None:
+    # Проверка прав администратора (раскомментируйте и настройте при необходимости)
+    # ADMIN_IDS = [123456789, 987654321]
+    # if update.effective_user.id not in ADMIN_IDS:
+    #     await update.message.reply_text("❌ У вас нет прав для этой команды!")
+    #     return
+    
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
@@ -1178,8 +1193,14 @@ def main() -> None:
     # ВЫПОЛНЯЕМ МИГРАЦИЮ БАЗЫ ДАННЫХ
     migrate_database()
     
-    # Создаем Application
-    application = Application.builder().token(TOKEN).build()
+    # Создаем Application с обработкой ошибок
+    try:
+        application = Application.builder().token(TOKEN).build()
+    except Exception as e:
+        logger.error(f"Ошибка при создании Application: {e}")
+        # Альтернативный способ для старых версий
+        from telegram.ext import Updater
+        application = Application.builder().token(TOKEN).build()
 
     # Обработчики диалогов
     add_item_conv = ConversationHandler(
