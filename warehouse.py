@@ -1,5 +1,6 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*per_message=False.*")
+import sqlite3
 import logging
 import os
 from telegram import (
@@ -19,18 +20,16 @@ from telegram.ext import (
 )
 from datetime import datetime, timedelta
 import calendar
-import psycopg2
-import urllib.parse as urlparse
-from io import BytesIO
 
 # Настройки
 TOKEN = os.environ.get('BOT_TOKEN')
-DATABASE_URL = os.environ.get('DATABASE_URL')
+DB_NAME = "warehouse.db"
 IMAGES_DIR = "images"
 
 # Для Render используем абсолютные пути
 if os.environ.get('RENDER'):
     IMAGES_DIR = "/tmp/images"
+    DB_NAME = "/tmp/warehouse.db"
 
 # Состояния для ConversationHandler
 (
@@ -59,38 +58,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_connection():
-    """Установка соединения с PostgreSQL"""
-    try:
-        if DATABASE_URL:
-            # Parse the database URL
-            url = urlparse.urlparse(DATABASE_URL)
-            conn = psycopg2.connect(
-                database=url.path[1:],
-                user=url.username,
-                password=url.password,
-                host=url.hostname,
-                port=url.port,
-                sslmode='require'
-            )
-            return conn
-        else:
-            # Локальная разработка с SQLite (если нужно)
-            import sqlite3
-            return sqlite3.connect("warehouse.db")
-    except Exception as e:
-        logger.error(f"Ошибка подключения к БД: {e}")
-        raise
-
 def init_db():
-    """Инициализация базы данных"""
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Таблица категорий
     cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         )
     """)
@@ -98,61 +73,52 @@ def init_db():
     # Таблица товаров
     cur.execute("""
         CREATE TABLE IF NOT EXISTS items (
-            id SERIAL PRIMARY KEY,
-            category_id INTEGER REFERENCES categories(id),
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER,
             name TEXT,
             quantity INTEGER,
             image_path TEXT,
-            comment TEXT
+            comment TEXT,
+            FOREIGN KEY (category_id) REFERENCES categories (id)
         )
     """)
     
     # Таблица бронирований
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id SERIAL PRIMARY KEY,
-            item_id INTEGER REFERENCES items(id),
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
             quantity INTEGER,
             start_date TEXT,
             end_date TEXT,
             user_id INTEGER,
             username TEXT,
             first_name TEXT,
-            event_name TEXT
+            event_name TEXT,
+            FOREIGN KEY (item_id) REFERENCES items (id)
         )
     """)
     
     # Стандартные категории
-    categories = [
-        'Ткань (и изделия из ткани)',
-        'Стекло',
-        'Искусственные цветы и зелень',
-        'Крупные конструкции',
-        'Сезонное',
-        'Фурнитура',
-        'Деревянные изделия'
-    ]
-    
-    for category in categories:
-        cur.execute("INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (category,))
-    
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Ткань (и изделия из ткани)')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Стекло')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Искусственные цветы и зелень')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Крупные конструкции')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Сезонное')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Фурнитура')")
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Деревянные изделия')")
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
 
 def migrate_database():
     """Миграция базы данных для добавления новых колонок"""
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     try:
-        # Проверяем существование колонок в PostgreSQL
-        cur.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name='reservations'
-        """)
-        columns = [row[0] for row in cur.fetchall()]
+        # Проверяем существование колонок
+        cur.execute("PRAGMA table_info(reservations)")
+        columns = [column[1] for column in cur.fetchall()]
         
         # Добавляем недостающие колонки
         if 'user_id' not in columns:
@@ -192,7 +158,7 @@ async def start(update: Update, context: CallbackContext) -> None:
     )
 
 async def add_item_start(update: Update, context: CallbackContext) -> int:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("SELECT id, name FROM categories")
     categories = cur.fetchall()
@@ -214,11 +180,10 @@ async def category_selection(update: Update, context: CallbackContext) -> int:
     context.user_data["category_id"] = category_id
     
     # Получаем название категории для красивого отображения
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
-    result = cur.fetchone()
-    category_name = result[0] if result else "Неизвестная категория"
+    cur.execute("SELECT name FROM categories WHERE id = ?", (category_id,))
+    category_name = cur.fetchone()[0]
     conn.close()
     
     await query.edit_message_text(f"📁 Категория: {category_name}\n\nВведите название позиции:")
@@ -231,10 +196,10 @@ async def item_name_input(update: Update, context: CallbackContext) -> int:
     # Проверяем, существует ли уже позиция с таким названием в этой категории
     category_id = context.user_data["category_id"]
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, quantity, image_path, comment FROM items WHERE category_id = %s AND name = %s",
+        "SELECT id, quantity, image_path, comment FROM items WHERE category_id = ? AND name = ?",
         (category_id, item_name)
     )
     existing_item = cur.fetchone()
@@ -268,10 +233,10 @@ async def item_quantity_input(update: Update, context: CallbackContext) -> int:
             item_id, old_quantity, image_path, comment = existing_item
             new_quantity = old_quantity + quantity
             
-            conn = get_connection()
+            conn = sqlite3.connect(DB_NAME)
             cur = conn.cursor()
             cur.execute(
-                "UPDATE items SET quantity = %s WHERE id = %s",
+                "UPDATE items SET quantity = ? WHERE id = ?",
                 (new_quantity, item_id)
             )
             conn.commit()
@@ -313,10 +278,10 @@ async def item_comment_input(update: Update, context: CallbackContext) -> int:
     comment = update.message.text
     
     # Сохранение новой позиции в БД
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO items (category_id, name, quantity, image_path, comment) VALUES (%s, %s, %s, %s, %s)",
+        "INSERT INTO items (category_id, name, quantity, image_path, comment) VALUES (?, ?, ?, ?, ?)",
         (
             context.user_data["category_id"],
             context.user_data["item_name"],
@@ -335,6 +300,7 @@ async def item_comment_input(update: Update, context: CallbackContext) -> int:
     )
     return ConversationHandler.END
 
+# Функции для календаря
 def generate_calendar(year=None, month=None, selection_type="start"):
     """Генерирует inline-клавиатуру с календарем"""
     now = datetime.now()
@@ -343,16 +309,22 @@ def generate_calendar(year=None, month=None, selection_type="start"):
     if month is None:
         month = now.month
     
+    # Создаем календарь
     cal = calendar.monthcalendar(year, month)
     month_name = calendar.month_name[month]
     
+    # Создаем кнопки для дней
     keyboard = []
+    
+    # Заголовок с месяцем и годом
     header = [InlineKeyboardButton(f"{month_name} {year}", callback_data="ignore")]
     keyboard.append(header)
     
+    # Дни недели
     week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     keyboard.append([InlineKeyboardButton(day, callback_data="ignore") for day in week_days])
     
+    # Дни месяца
     for week in cal:
         week_buttons = []
         for day in week:
@@ -363,6 +335,7 @@ def generate_calendar(year=None, month=None, selection_type="start"):
                 week_buttons.append(InlineKeyboardButton(str(day), callback_data=f"date_{selection_type}_{date_str}"))
         keyboard.append(week_buttons)
     
+    # Кнопки навигации
     prev_month = month - 1 if month > 1 else 12
     prev_year = year if month > 1 else year - 1
     next_month = month + 1 if month < 12 else 1
@@ -377,8 +350,9 @@ def generate_calendar(year=None, month=None, selection_type="start"):
     
     return InlineKeyboardMarkup(keyboard)
 
+# Функции для бронирования
 async def reserve_item_start(update: Update, context: CallbackContext) -> int:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity
@@ -413,22 +387,17 @@ async def reserve_item_selection(update: Update, context: CallbackContext) -> in
     context.user_data["reserve_item_id"] = item_id
     
     # Получаем информацию о товаре
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT i.name, c.name, i.quantity 
         FROM items i 
         JOIN categories c ON i.category_id = c.id 
-        WHERE i.id = %s
+        WHERE i.id = ?
     """, (item_id,))
-    result = cur.fetchone()
+    item_name, category_name, quantity = cur.fetchone()
     conn.close()
     
-    if not result:
-        await query.edit_message_text("❌ Товар не найден!")
-        return ConversationHandler.END
-        
-    item_name, category_name, quantity = result
     context.user_data["current_quantity"] = quantity
     await query.edit_message_text(
         f"📦 Товар: {category_name} - {item_name}\n"
@@ -544,11 +513,11 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         start_date = datetime.fromisoformat(context.user_data["reserve_start_date"]).date()
         end_date = datetime.fromisoformat(context.user_data["reserve_end_date"]).date()
         
-        conn = get_connection()
+        conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
         
         # Получаем общее количество товара
-        cur.execute("SELECT quantity FROM items WHERE id = %s", (item_id,))
+        cur.execute("SELECT quantity FROM items WHERE id = ?", (item_id,))
         result = cur.fetchone()
         if not result:
             await update.message.reply_text("❌ Товар не найден!")
@@ -558,10 +527,10 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         # Получаем сумму забронированных quantity в пересекающиеся периоды
         cur.execute("""
             SELECT SUM(quantity) FROM reservations 
-            WHERE item_id = %s 
-            AND ((start_date <= %s AND end_date >= %s) 
-                 OR (start_date <= %s AND end_date >= %s)
-                 OR (start_date >= %s AND end_date <= %s))
+            WHERE item_id = ? 
+            AND ((start_date <= ? AND end_date >= ?) 
+                 OR (start_date <= ? AND end_date >= ?)
+                 OR (start_date >= ? AND end_date <= ?))
         """, (item_id, start_date, start_date, end_date, end_date, start_date, end_date))
         
         result = cur.fetchone()
@@ -585,7 +554,7 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         
         # Создание брони
         cur.execute(
-            "INSERT INTO reservations (item_id, quantity, start_date, end_date, user_id, username, first_name, event_name) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO reservations (item_id, quantity, start_date, end_date, user_id, username, first_name, event_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item_id,
                 reserve_quantity,
@@ -600,7 +569,7 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         conn.commit()
         
         # Получаем название товара для сообщения
-        cur.execute("SELECT name FROM items WHERE id = %s", (item_id,))
+        cur.execute("SELECT name FROM items WHERE id = ?", (item_id,))
         result = cur.fetchone()
         if not result:
             await update.message.reply_text("❌ Ошибка при получении информации о товаре!")
@@ -623,8 +592,9 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("❌ Произошла ошибка при создании брони. Попробуйте еще раз.")
         return ConversationHandler.END
 
+# Функции для возврата брони
 async def return_reservation(update: Update, context: CallbackContext) -> None:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT r.id, i.name, c.name, r.quantity, r.start_date, r.end_date, r.username, r.event_name
@@ -659,7 +629,7 @@ async def return_selection(update: Update, context: CallbackContext) -> None:
     await query.answer()
     reserve_id = int(query.data.split("_")[1])
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Получаем информацию о брони перед удалением
@@ -667,25 +637,20 @@ async def return_selection(update: Update, context: CallbackContext) -> None:
         SELECT i.name, r.username, r.event_name, r.user_id 
         FROM reservations r 
         JOIN items i ON r.item_id = i.id 
-        WHERE r.id = %s
+        WHERE r.id = ?
     """, (reserve_id,))
-    result = cur.fetchone()
+    item_name, username, event_name, user_id = cur.fetchone()
     
-    if not result:
-        await query.edit_message_text("❌ Бронь не найдена!")
-        return
-        
-    item_name, username, event_name, user_id = result
-    
-    cur.execute("DELETE FROM reservations WHERE id = %s", (reserve_id,))
+    cur.execute("DELETE FROM reservations WHERE id = ?", (reserve_id,))
     conn.commit()
     conn.close()
     
     event_text = f" для мероприятия '{event_name}'" if event_name else ""
     await query.edit_message_text(f"✅ Бронь '{item_name}'{event_text} от {username} успешно возвращена!")
 
+# Функции для удаления позиции
 async def delete_item(update: Update, context: CallbackContext) -> None:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity
@@ -717,37 +682,29 @@ async def delete_selection(update: Update, context: CallbackContext) -> None:
     await query.answer()
     item_id = int(query.data.split("_")[1])
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Получаем информацию о товаре перед удалением
-    cur.execute("SELECT name, image_path FROM items WHERE id = %s", (item_id,))
-    result = cur.fetchone()
-    
-    if not result:
-        await query.edit_message_text("❌ Позиция не найдена!")
-        return
-        
-    item_name, image_path = result
+    cur.execute("SELECT name, image_path FROM items WHERE id = ?", (item_id,))
+    item_name, image_path = cur.fetchone()
     
     # Удаление изображения
     if image_path and os.path.exists(image_path):
-        try:
-            os.remove(image_path)
-        except Exception as e:
-            logger.error(f"Ошибка при удалении изображения: {e}")
+        os.remove(image_path)
     
     # Удаление связанных бронирований
-    cur.execute("DELETE FROM reservations WHERE item_id = %s", (item_id,))
+    cur.execute("DELETE FROM reservations WHERE item_id = ?", (item_id,))
     # Удаление товара
-    cur.execute("DELETE FROM items WHERE id = %s", (item_id,))
+    cur.execute("DELETE FROM items WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
     
     await query.edit_message_text(f"✅ Позиция '{item_name}' успешно удалена!")
 
+# Функции для просмотра остатков
 async def current_stock(update: Update, context: CallbackContext) -> None:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT c.name, i.name, i.quantity, i.comment
@@ -807,20 +764,20 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
             await query.answer("❌ Дата не может быть в прошлом!", show_alert=True)
             return CHECK_DATE
             
-        conn = get_connection()
+        conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
         
         cur.execute("""
             SELECT 
                 c.name,
                 i.name,
-                i.quantity - COALESCE(SUM(r.quantity), 0) as available
+                i.quantity - IFNULL(SUM(r.quantity), 0) as available
             FROM items i
             JOIN categories c ON i.category_id = c.id
             LEFT JOIN reservations r ON i.id = r.item_id 
-                AND r.start_date <= %s 
-                AND r.end_date >= %s
-            GROUP BY i.id, c.name, i.name, i.quantity
+                AND r.start_date <= ? 
+                AND r.end_date >= ?
+            GROUP BY i.id
             ORDER BY c.name, i.name
         """, (target_date.isoformat(), target_date.isoformat()))
         
@@ -846,6 +803,7 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
     
     return CHECK_DATE
 
+# Функции для просмотра позиции
 async def view_item_start(update: Update, context: CallbackContext) -> int:
     buttons = [
         [InlineKeyboardButton("📁 Поиск по категориям", callback_data="view_categories")],
@@ -864,7 +822,7 @@ async def view_category_method(update: Update, context: CallbackContext) -> int:
     
     if query.data == "view_categories":
         # Показываем список категорий
-        conn = get_connection()
+        conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
         cur.execute("SELECT id, name FROM categories")
         categories = cur.fetchall()
@@ -896,20 +854,19 @@ async def view_category_selection(update: Update, context: CallbackContext) -> i
     category_id = int(query.data.split("_")[1])
     
     # Получаем позиции в выбранной категории
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, i.quantity 
         FROM items i 
-        WHERE i.category_id = %s
+        WHERE i.category_id = ?
         ORDER BY i.name
     """, (category_id,))
     items = cur.fetchall()
     
     # Получаем название категории
-    cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
-    result = cur.fetchone()
-    category_name = result[0] if result else "Неизвестная категория"
+    cur.execute("SELECT name FROM categories WHERE id = ?", (category_id,))
+    category_name = cur.fetchone()[0]
     conn.close()
     
     if not items:
@@ -933,13 +890,13 @@ async def view_category_selection(update: Update, context: CallbackContext) -> i
 async def search_item_input(update: Update, context: CallbackContext) -> int:
     search_term = update.message.text
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity 
         FROM items i 
         JOIN categories c ON i.category_id = c.id
-        WHERE i.name LIKE %s
+        WHERE i.name LIKE ?
         ORDER BY c.name, i.name
     """, (f"%{search_term}%",))
     items = cur.fetchall()
@@ -974,7 +931,7 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
         
     item_id = int(query.data.split("_")[1])
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Получаем информацию о товаре
@@ -982,7 +939,7 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
         SELECT i.name, c.name, i.quantity, i.comment, i.image_path
         FROM items i 
         JOIN categories c ON i.category_id = c.id 
-        WHERE i.id = %s
+        WHERE i.id = ?
     """, (item_id,))
     item_info = cur.fetchone()
     
@@ -996,7 +953,7 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
     cur.execute("""
         SELECT start_date, end_date, quantity, username, event_name
         FROM reservations 
-        WHERE item_id = %s AND end_date >= date('now')
+        WHERE item_id = ? AND end_date >= date('now')
         ORDER BY start_date
     """, (item_id,))
     reservations = cur.fetchall()
@@ -1038,18 +995,19 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
     
     return ConversationHandler.END
 
+# Функции для просмотра своих бронирований
 async def my_reservations(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     user_id = user.id
     
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
         SELECT r.id, i.name, c.name, r.quantity, r.start_date, r.end_date, r.event_name
         FROM reservations r 
         JOIN items i ON r.item_id = i.id
         JOIN categories c ON i.category_id = c.id
-        WHERE r.user_id = %s AND r.end_date >= date('now')
+        WHERE r.user_id = ? AND r.end_date >= date('now')
         ORDER BY r.end_date
     """, (user_id,))
     reservations = cur.fetchall()
@@ -1075,8 +1033,9 @@ async def my_reservations(update: Update, context: CallbackContext) -> None:
     
     await update.message.reply_text(response)
 
+# Функции для администраторов
 async def send_reminders(update: Update, context: CallbackContext) -> None:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Находим брони, которые заканчиваются сегодня или уже просрочены
@@ -1132,7 +1091,7 @@ async def send_reminders(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(response)
 
 async def notify_all_users(update: Update, context: CallbackContext) -> None:
-    conn = get_connection()
+    conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
     # Находим все активные брони
@@ -1151,7 +1110,7 @@ async def notify_all_users(update: Update, context: CallbackContext) -> None:
                 SELECT i.name, r.end_date, r.event_name
                 FROM reservations r 
                 JOIN items i ON r.item_id = i.id
-                WHERE r.user_id = %s AND r.end_date >= date('now')
+                WHERE r.user_id = ? AND r.end_date >= date('now')
                 ORDER BY r.end_date
             """, (user_id,))
             user_reservations = cur.fetchall()
@@ -1208,9 +1167,6 @@ async def help_command(update: Update, context: CallbackContext) -> None:
 Для начала работы нажмите /start
     """
     await update.message.reply_text(help_text)
-
-async def error_handler(update: Update, context: CallbackContext) -> None:
-    logger.error(f"Ошибка при обработке обновления: {context.error}")
 
 def main() -> None:
     # Создаем папку для изображений
@@ -1295,6 +1251,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex("^Мои бронирования$"), my_reservations))
 
     # Добавляем обработчик ошибок
+    async def error_handler(update: Update, context: CallbackContext) -> None:
+        logger.error(f"Ошибка при обработке обновления: {context.error}")
+        
     application.add_error_handler(error_handler)
 
     # Запуск бота
