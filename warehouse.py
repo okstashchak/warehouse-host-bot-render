@@ -1,6 +1,5 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*per_message=False.*")
-import sqlite3
 import logging
 import os
 from telegram import (
@@ -10,26 +9,28 @@ from telegram import (
     InlineKeyboardButton,
 )
 from telegram.ext import (
-    Application,
+    Updater,
     CommandHandler,
     MessageHandler,
     CallbackContext,
     ConversationHandler,
     CallbackQueryHandler,
-    filters
+    Filters
 )
 from datetime import datetime, timedelta
 import calendar
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import urllib.parse as urlparse
 
-# Настройки - получаем токен из переменных окружения
-TOKEN = os.environ.get('BOT_TOKEN', '7576912897:AAGdkGgBYLrh1jjIUwvskqh6Ptqk-fcCqPM')
-DB_NAME = "warehouse.db"
+# Настройки
+TOKEN = os.environ.get('BOT_TOKEN')
+DATABASE_URL = os.environ.get('DATABASE_URL')
 IMAGES_DIR = "images"
 
 # Для Render используем абсолютные пути
 if os.environ.get('RENDER'):
     IMAGES_DIR = "/tmp/images"
-    DB_NAME = "/tmp/warehouse.db"
 
 # Состояния для ConversationHandler
 (
@@ -58,14 +59,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_connection():
+    """Установка соединения с PostgreSQL"""
+    try:
+        if DATABASE_URL:
+            # Parse the database URL
+            url = urlparse.urlparse(DATABASE_URL)
+            conn = psycopg2.connect(
+                database=url.path[1:],
+                user=url.username,
+                password=url.password,
+                host=url.hostname,
+                port=url.port,
+                sslmode='require'
+            )
+            return conn
+        else:
+            # Локальная разработка с SQLite (если нужно)
+            import sqlite3
+            return sqlite3.connect("warehouse.db")
+    except Exception as e:
+        logger.error(f"Ошибка подключения к БД: {e}")
+        raise
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    """Инициализация базы данных"""
+    conn = get_connection()
     cur = conn.cursor()
     
     # Таблица категорий
     cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE
         )
     """)
@@ -73,52 +98,61 @@ def init_db():
     # Таблица товаров
     cur.execute("""
         CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            category_id INTEGER REFERENCES categories(id),
             name TEXT,
             quantity INTEGER,
             image_path TEXT,
-            comment TEXT,
-            FOREIGN KEY (category_id) REFERENCES categories (id)
+            comment TEXT
         )
     """)
     
-    # Таблица бронирований - ОБНОВЛЕННАЯ ВЕРСИЯ
+    # Таблица бронирований
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            item_id INTEGER REFERENCES items(id),
             quantity INTEGER,
             start_date TEXT,
             end_date TEXT,
             user_id INTEGER,
             username TEXT,
             first_name TEXT,
-            event_name TEXT,
-            FOREIGN KEY (item_id) REFERENCES items (id)
+            event_name TEXT
         )
     """)
     
     # Стандартные категории
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Ткань (и изделия из ткани)')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Стекло')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Искусственные цветы и зелень')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Крупные конструкции')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Сезонное')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Фурнитура')")
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Деревянные изделия')")
+    categories = [
+        'Ткань (и изделия из ткани)',
+        'Стекло',
+        'Искусственные цветы и зелень',
+        'Крупные конструкции',
+        'Сезонное',
+        'Фурнитура',
+        'Деревянные изделия'
+    ]
+    
+    for category in categories:
+        cur.execute("INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (category,))
+    
     conn.commit()
     conn.close()
+    logger.info("База данных инициализирована")
 
 def migrate_database():
     """Миграция базы данных для добавления новых колонок"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     
     try:
-        # Проверяем существование колонок
-        cur.execute("PRAGMA table_info(reservations)")
-        columns = [column[1] for column in cur.fetchall()]
+        # Проверяем существование колонок в PostgreSQL
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='reservations'
+        """)
+        columns = [row[0] for row in cur.fetchall()]
         
         # Добавляем недостающие колонки
         if 'user_id' not in columns:
@@ -145,20 +179,20 @@ def migrate_database():
     finally:
         conn.close()
 
-async def start(update: Update, context: CallbackContext) -> None:
+def start(update: Update, context: CallbackContext) -> None:
     buttons = [
         ["Добавить позицию", "Забронировать"],
         ["Вернуть бронь", "Удалить позицию"],
         ["Текущие остатки", "Остатки на дату"],
         ["Просмотр позиции", "Мои бронирования"],
     ]
-    await update.message.reply_text(
+    update.message.reply_text(
         "🏭 Бот управления складом\n\nВыберите действие:",
         reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
     )
 
-async def add_item_start(update: Update, context: CallbackContext) -> int:
-    conn = sqlite3.connect(DB_NAME)
+def add_item_start(update: Update, context: CallbackContext) -> int:
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, name FROM categories")
     categories = cur.fetchall()
@@ -167,39 +201,40 @@ async def add_item_start(update: Update, context: CallbackContext) -> int:
     buttons = [
         [InlineKeyboardButton(cat[1], callback_data=f"cat_{cat[0]}")] for cat in categories
     ]
-    await update.message.reply_text(
+    update.message.reply_text(
         "📁 Выберите категорию:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return CATEGORY_SELECTION
 
-async def category_selection(update: Update, context: CallbackContext) -> int:
+def category_selection(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     category_id = int(query.data.split("_")[1])
     context.user_data["category_id"] = category_id
     
     # Получаем название категории для красивого отображения
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT name FROM categories WHERE id = ?", (category_id,))
-    category_name = cur.fetchone()[0]
+    cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
+    result = cur.fetchone()
+    category_name = result[0] if result else "Неизвестная категория"
     conn.close()
     
-    await query.edit_message_text(f"📁 Категория: {category_name}\n\nВведите название позиции:")
+    query.edit_message_text(f"📁 Категория: {category_name}\n\nВведите название позиции:")
     return ITEM_NAME
 
-async def item_name_input(update: Update, context: CallbackContext) -> int:
+def item_name_input(update: Update, context: CallbackContext) -> int:
     item_name = update.message.text
     context.user_data["item_name"] = item_name
     
     # Проверяем, существует ли уже позиция с таким названием в этой категории
     category_id = context.user_data["category_id"]
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, quantity, image_path, comment FROM items WHERE category_id = ? AND name = ?",
+        "SELECT id, quantity, image_path, comment FROM items WHERE category_id = %s AND name = %s",
         (category_id, item_name)
     )
     existing_item = cur.fetchone()
@@ -208,7 +243,7 @@ async def item_name_input(update: Update, context: CallbackContext) -> int:
     if existing_item:
         # Если позиция существует, сохраняем ее данные и пропускаем запрос фото
         context.user_data["existing_item"] = existing_item
-        await update.message.reply_text(
+        update.message.reply_text(
             f"✅ Позиция '{item_name}' уже существует!\n"
             f"Текущее количество: {existing_item[1]} шт.\n\n"
             "🔢 Введите количество для добавления:"
@@ -216,14 +251,14 @@ async def item_name_input(update: Update, context: CallbackContext) -> int:
         return ITEM_QUANTITY
     else:
         # Новая позиция - запрашиваем количество как обычно
-        await update.message.reply_text("🔢 Введите количество:")
+        update.message.reply_text("🔢 Введите количество:")
         return ITEM_QUANTITY
 
-async def item_quantity_input(update: Update, context: CallbackContext) -> int:
+def item_quantity_input(update: Update, context: CallbackContext) -> int:
     try:
         quantity = int(update.message.text)
         if quantity <= 0:
-            await update.message.reply_text("❌ Количество должно быть больше 0! Введите корректное количество:")
+            update.message.reply_text("❌ Количество должно быть больше 0! Введите корректное количество:")
             return ITEM_QUANTITY
             
         # Проверяем, обновляем ли существующую позицию или создаем новую
@@ -233,16 +268,16 @@ async def item_quantity_input(update: Update, context: CallbackContext) -> int:
             item_id, old_quantity, image_path, comment = existing_item
             new_quantity = old_quantity + quantity
             
-            conn = sqlite3.connect(DB_NAME)
+            conn = get_connection()
             cur = conn.cursor()
             cur.execute(
-                "UPDATE items SET quantity = ? WHERE id = ?",
+                "UPDATE items SET quantity = %s WHERE id = %s",
                 (new_quantity, item_id)
             )
             conn.commit()
             conn.close()
             
-            await update.message.reply_text(
+            update.message.reply_text(
                 f"✅ Позиция обновлена!\n"
                 f"📦 {context.user_data['item_name']}\n"
                 f"📊 Новое количество: {new_quantity} шт."
@@ -254,34 +289,34 @@ async def item_quantity_input(update: Update, context: CallbackContext) -> int:
         else:
             # Создаем новую позицию - запрашиваем фото
             context.user_data["quantity"] = quantity
-            await update.message.reply_text("📸 Загрузите фото товара:")
+            update.message.reply_text("📸 Загрузите фото товара:")
             return ITEM_IMAGE
             
     except ValueError:
-        await update.message.reply_text("❌ Введите целое число!")
+        update.message.reply_text("❌ Введите целое число!")
         return ITEM_QUANTITY
 
-async def item_image_input(update: Update, context: CallbackContext) -> int:
+def item_image_input(update: Update, context: CallbackContext) -> int:
     if not update.message.photo:
-        await update.message.reply_text("❌ Пожалуйста, загрузите фото!")
+        update.message.reply_text("❌ Пожалуйста, загрузите фото!")
         return ITEM_IMAGE
     
     os.makedirs(IMAGES_DIR, exist_ok=True)
-    photo_file = await update.message.photo[-1].get_file()
+    photo_file = update.message.photo[-1].get_file()
     image_path = os.path.join(IMAGES_DIR, f"{datetime.now().timestamp()}.jpg")
-    await photo_file.download_to_drive(image_path)
+    photo_file.download(image_path)
     context.user_data["image_path"] = image_path
-    await update.message.reply_text("📝 Введите комментарий к товару:")
+    update.message.reply_text("📝 Введите комментарий к товару:")
     return ITEM_COMMENT
 
-async def item_comment_input(update: Update, context: CallbackContext) -> int:
+def item_comment_input(update: Update, context: CallbackContext) -> int:
     comment = update.message.text
     
     # Сохранение новой позиции в БД
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO items (category_id, name, quantity, image_path, comment) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO items (category_id, name, quantity, image_path, comment) VALUES (%s, %s, %s, %s, %s)",
         (
             context.user_data["category_id"],
             context.user_data["item_name"],
@@ -293,14 +328,13 @@ async def item_comment_input(update: Update, context: CallbackContext) -> int:
     conn.commit()
     conn.close()
     
-    await update.message.reply_text(
+    update.message.reply_text(
         f"✅ Позиция успешно добавлена на склад!\n"
         f"📦 {context.user_data['item_name']}\n"
         f"📊 Количество: {context.user_data['quantity']} шт."
     )
     return ConversationHandler.END
 
-# Функции для календаря
 def generate_calendar(year=None, month=None, selection_type="start"):
     """Генерирует inline-клавиатуру с календарем"""
     now = datetime.now()
@@ -309,22 +343,16 @@ def generate_calendar(year=None, month=None, selection_type="start"):
     if month is None:
         month = now.month
     
-    # Создаем календарь
     cal = calendar.monthcalendar(year, month)
     month_name = calendar.month_name[month]
     
-    # Создаем кнопки для дней
     keyboard = []
-    
-    # Заголовок с месяцем и годом
     header = [InlineKeyboardButton(f"{month_name} {year}", callback_data="ignore")]
     keyboard.append(header)
     
-    # Дни недели
     week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     keyboard.append([InlineKeyboardButton(day, callback_data="ignore") for day in week_days])
     
-    # Дни месяца
     for week in cal:
         week_buttons = []
         for day in week:
@@ -335,7 +363,6 @@ def generate_calendar(year=None, month=None, selection_type="start"):
                 week_buttons.append(InlineKeyboardButton(str(day), callback_data=f"date_{selection_type}_{date_str}"))
         keyboard.append(week_buttons)
     
-    # Кнопки навигации
     prev_month = month - 1 if month > 1 else 12
     prev_year = year if month > 1 else year - 1
     next_month = month + 1 if month < 12 else 1
@@ -350,9 +377,8 @@ def generate_calendar(year=None, month=None, selection_type="start"):
     
     return InlineKeyboardMarkup(keyboard)
 
-# Функции для бронирования с добавлением информации о пользователе и мероприятии
-async def reserve_item_start(update: Update, context: CallbackContext) -> int:
-    conn = sqlite3.connect(DB_NAME)
+def reserve_item_start(update: Update, context: CallbackContext) -> int:
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity
@@ -364,7 +390,7 @@ async def reserve_item_start(update: Update, context: CallbackContext) -> int:
     conn.close()
     
     if not items:
-        await update.message.reply_text("❌ На складе нет доступных позиций!")
+        update.message.reply_text("❌ На складе нет доступных позиций!")
         return ConversationHandler.END
     
     buttons = []
@@ -374,49 +400,54 @@ async def reserve_item_start(update: Update, context: CallbackContext) -> int:
             callback_data=f"ritem_{item_id}"
         )])
     
-    await update.message.reply_text(
+    update.message.reply_text(
         "📦 Выберите позицию для бронирования:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return RESERVE_ITEM_SELECTION
 
-async def reserve_item_selection(update: Update, context: CallbackContext) -> int:
+def reserve_item_selection(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     item_id = int(query.data.split("_")[1])
     context.user_data["reserve_item_id"] = item_id
     
     # Получаем информацию о товаре
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT i.name, c.name, i.quantity 
         FROM items i 
         JOIN categories c ON i.category_id = c.id 
-        WHERE i.id = ?
+        WHERE i.id = %s
     """, (item_id,))
-    item_name, category_name, quantity = cur.fetchone()
+    result = cur.fetchone()
     conn.close()
     
+    if not result:
+        query.edit_message_text("❌ Товар не найден!")
+        return ConversationHandler.END
+        
+    item_name, category_name, quantity = result
     context.user_data["current_quantity"] = quantity
-    await query.edit_message_text(
+    query.edit_message_text(
         f"📦 Товар: {category_name} - {item_name}\n"
         f"📊 Доступно: {quantity} шт.\n\n"
         "Введите количество для бронирования:"
     )
     return RESERVE_QUANTITY
 
-async def reserve_quantity_input(update: Update, context: CallbackContext) -> int:
+def reserve_quantity_input(update: Update, context: CallbackContext) -> int:
     try:
         reserve_quantity = int(update.message.text)
         current_quantity = context.user_data["current_quantity"]
         
         if reserve_quantity <= 0:
-            await update.message.reply_text("❌ Количество должно быть больше 0! Повторите ввод:")
+            update.message.reply_text("❌ Количество должно быть больше 0! Повторите ввод:")
             return RESERVE_QUANTITY
         
         if reserve_quantity > current_quantity:
-            await update.message.reply_text(
+            update.message.reply_text(
                 f"❌ Недостаточно товара! Доступно только {current_quantity} шт.\n"
                 "Введите новое количество:"
             )
@@ -425,23 +456,23 @@ async def reserve_quantity_input(update: Update, context: CallbackContext) -> in
         context.user_data["reserve_quantity"] = reserve_quantity
         
         # Показываем календарь для выбора даты начала
-        await update.message.reply_text(
+        update.message.reply_text(
             "📅 Выберите дату НАЧАЛА бронирования:",
             reply_markup=generate_calendar(selection_type="start")
         )
         return RESERVE_START_DATE
     except ValueError:
-        await update.message.reply_text("❌ Введите целое число!")
+        update.message.reply_text("❌ Введите целое число!")
         return RESERVE_QUANTITY
 
-async def reserve_start_date_input(update: Update, context: CallbackContext) -> int:
+def reserve_start_date_input(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     if query.data.startswith("nav_start"):
         # Навигация по календарю
         _, _, year, month = query.data.split("_")
-        await query.edit_message_text(
+        query.edit_message_text(
             "📅 Выберите дату НАЧАЛА бронирования:",
             reply_markup=generate_calendar(int(year), int(month), "start")
         )
@@ -454,13 +485,13 @@ async def reserve_start_date_input(update: Update, context: CallbackContext) -> 
         today = datetime.now().date()
         
         if start_date < today:
-            await query.answer("❌ Дата начала не может быть в прошлом!", show_alert=True)
+            query.answer("❌ Дата начала не может быть в прошлом!", show_alert=True)
             return RESERVE_START_DATE
         
         context.user_data["reserve_start_date"] = start_date.isoformat()
         
         # Показываем календарь для выбора даты окончания
-        await query.edit_message_text(
+        query.edit_message_text(
             "📅 Выберите дату ОКОНЧАНИЯ бронирования:",
             reply_markup=generate_calendar(selection_type="end")
         )
@@ -468,14 +499,14 @@ async def reserve_start_date_input(update: Update, context: CallbackContext) -> 
     
     return RESERVE_START_DATE
 
-async def reserve_end_date_input(update: Update, context: CallbackContext) -> int:
+def reserve_end_date_input(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     if query.data.startswith("nav_end"):
         # Навигация по календарю
         _, _, year, month = query.data.split("_")
-        await query.edit_message_text(
+        query.edit_message_text(
             "📅 Выберите дату ОКОНЧАНИЯ бронирования:",
             reply_markup=generate_calendar(int(year), int(month), "end")
         )
@@ -488,21 +519,21 @@ async def reserve_end_date_input(update: Update, context: CallbackContext) -> in
         start_date = datetime.fromisoformat(context.user_data["reserve_start_date"]).date()
         
         if end_date <= start_date:
-            await query.answer("❌ Дата окончания должна быть после даты начала!", show_alert=True)
+            query.answer("❌ Дата окончания должна быть после даты начала!", show_alert=True)
             return RESERVE_END_DATE
         
         # Сохраняем дату окончания
         context.user_data["reserve_end_date"] = end_date.isoformat()
         
         # Запрашиваем название мероприятия
-        await query.edit_message_text(
+        query.edit_message_text(
             "🎯 Введите название мероприятия или комментарий к бронированию:"
         )
         return RESERVE_EVENT
     
     return RESERVE_END_DATE
 
-async def reserve_event_input(update: Update, context: CallbackContext) -> int:
+def reserve_event_input(update: Update, context: CallbackContext) -> int:
     try:
         event_name = update.message.text
         context.user_data["reserve_event"] = event_name
@@ -513,24 +544,24 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         start_date = datetime.fromisoformat(context.user_data["reserve_start_date"]).date()
         end_date = datetime.fromisoformat(context.user_data["reserve_end_date"]).date()
         
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_connection()
         cur = conn.cursor()
         
         # Получаем общее количество товара
-        cur.execute("SELECT quantity FROM items WHERE id = ?", (item_id,))
+        cur.execute("SELECT quantity FROM items WHERE id = %s", (item_id,))
         result = cur.fetchone()
         if not result:
-            await update.message.reply_text("❌ Товар не найден!")
+            update.message.reply_text("❌ Товар не найден!")
             return ConversationHandler.END
         total_quantity = result[0]
         
         # Получаем сумму забронированных quantity в пересекающиеся периоды
         cur.execute("""
             SELECT SUM(quantity) FROM reservations 
-            WHERE item_id = ? 
-            AND ((start_date <= ? AND end_date >= ?) 
-                 OR (start_date <= ? AND end_date >= ?)
-                 OR (start_date >= ? AND end_date <= ?))
+            WHERE item_id = %s 
+            AND ((start_date <= %s AND end_date >= %s) 
+                 OR (start_date <= %s AND end_date >= %s)
+                 OR (start_date >= %s AND end_date <= %s))
         """, (item_id, start_date, start_date, end_date, end_date, start_date, end_date))
         
         result = cur.fetchone()
@@ -539,7 +570,7 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         available_quantity = total_quantity - reserved_quantity
         
         if reserve_quantity > available_quantity:
-            await update.message.reply_text(
+            update.message.reply_text(
                 f"❌ Недостаточно товара в указанный период! Доступно только {available_quantity} шт.\n\n"
                 "Введите новое количество для бронирования:"
             )
@@ -554,7 +585,7 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         
         # Создание брони
         cur.execute(
-            "INSERT INTO reservations (item_id, quantity, start_date, end_date, user_id, username, first_name, event_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO reservations (item_id, quantity, start_date, end_date, user_id, username, first_name, event_name) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 item_id,
                 reserve_quantity,
@@ -569,15 +600,15 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         conn.commit()
         
         # Получаем название товара для сообщения
-        cur.execute("SELECT name FROM items WHERE id = ?", (item_id,))
+        cur.execute("SELECT name FROM items WHERE id = %s", (item_id,))
         result = cur.fetchone()
         if not result:
-            await update.message.reply_text("❌ Ошибка при получении информации о товаре!")
+            update.message.reply_text("❌ Ошибка при получении информации о товаре!")
             return ConversationHandler.END
         item_name = result[0]
         conn.close()
         
-        await update.message.reply_text(
+        update.message.reply_text(
             f"✅ Бронь успешно создана!\n\n"
             f"📦 Товар: {item_name}\n"
             f"📊 Количество: {reserve_quantity} шт.\n"
@@ -589,12 +620,11 @@ async def reserve_event_input(update: Update, context: CallbackContext) -> int:
         
     except Exception as e:
         logger.error(f"Ошибка при создании брони: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при создании брони. Попробуйте еще раз.")
+        update.message.reply_text("❌ Произошла ошибка при создании брони. Попробуйте еще раз.")
         return ConversationHandler.END
 
-# Функции для возврата брони с информацией о пользователе
-async def return_reservation(update: Update, context: CallbackContext) -> None:
-    conn = sqlite3.connect(DB_NAME)
+def return_reservation(update: Update, context: CallbackContext) -> None:
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT r.id, i.name, c.name, r.quantity, r.start_date, r.end_date, r.username, r.event_name
@@ -608,7 +638,7 @@ async def return_reservation(update: Update, context: CallbackContext) -> None:
     conn.close()
     
     if not reservations:
-        await update.message.reply_text("❌ Нет активных бронирований!")
+        update.message.reply_text("❌ Нет активных бронирований!")
         return
     
     buttons = []
@@ -619,17 +649,17 @@ async def return_reservation(update: Update, context: CallbackContext) -> None:
             callback_data=f"ret_{res_id}"
         )])
     
-    await update.message.reply_text(
+    update.message.reply_text(
         "📦 Выберите бронь для возврата:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-async def return_selection(update: Update, context: CallbackContext) -> None:
+def return_selection(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     reserve_id = int(query.data.split("_")[1])
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     
     # Получаем информацию о брони перед удалением
@@ -637,20 +667,25 @@ async def return_selection(update: Update, context: CallbackContext) -> None:
         SELECT i.name, r.username, r.event_name, r.user_id 
         FROM reservations r 
         JOIN items i ON r.item_id = i.id 
-        WHERE r.id = ?
+        WHERE r.id = %s
     """, (reserve_id,))
-    item_name, username, event_name, user_id = cur.fetchone()
+    result = cur.fetchone()
     
-    cur.execute("DELETE FROM reservations WHERE id = ?", (reserve_id,))
+    if not result:
+        query.edit_message_text("❌ Бронь не найдена!")
+        return
+        
+    item_name, username, event_name, user_id = result
+    
+    cur.execute("DELETE FROM reservations WHERE id = %s", (reserve_id,))
     conn.commit()
     conn.close()
     
     event_text = f" для мероприятия '{event_name}'" if event_name else ""
-    await query.edit_message_text(f"✅ Бронь '{item_name}'{event_text} от {username} успешно возвращена!")
+    query.edit_message_text(f"✅ Бронь '{item_name}'{event_text} от {username} успешно возвращена!")
 
-# Функции для удаления позиции
-async def delete_item(update: Update, context: CallbackContext) -> None:
-    conn = sqlite3.connect(DB_NAME)
+def delete_item(update: Update, context: CallbackContext) -> None:
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity
@@ -662,7 +697,7 @@ async def delete_item(update: Update, context: CallbackContext) -> None:
     conn.close()
     
     if not items:
-        await update.message.reply_text("❌ Нет позиций для удаления!")
+        update.message.reply_text("❌ Нет позиций для удаления!")
         return
     
     buttons = []
@@ -672,39 +707,47 @@ async def delete_item(update: Update, context: CallbackContext) -> None:
             callback_data=f"del_{item_id}"
         )])
     
-    await update.message.reply_text(
+    update.message.reply_text(
         "🗑️ Выберите позицию для удаления:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-async def delete_selection(update: Update, context: CallbackContext) -> None:
+def delete_selection(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     item_id = int(query.data.split("_")[1])
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     
     # Получаем информацию о товаре перед удалением
-    cur.execute("SELECT name, image_path FROM items WHERE id = ?", (item_id,))
-    item_name, image_path = cur.fetchone()
+    cur.execute("SELECT name, image_path FROM items WHERE id = %s", (item_id,))
+    result = cur.fetchone()
+    
+    if not result:
+        query.edit_message_text("❌ Позиция не найдена!")
+        return
+        
+    item_name, image_path = result
     
     # Удаление изображения
     if image_path and os.path.exists(image_path):
-        os.remove(image_path)
+        try:
+            os.remove(image_path)
+        except Exception as e:
+            logger.error(f"Ошибка при удалении изображения: {e}")
     
     # Удаление связанных бронирований
-    cur.execute("DELETE FROM reservations WHERE item_id = ?", (item_id,))
+    cur.execute("DELETE FROM reservations WHERE item_id = %s", (item_id,))
     # Удаление товара
-    cur.execute("DELETE FROM items WHERE id = ?", (item_id,))
+    cur.execute("DELETE FROM items WHERE id = %s", (item_id,))
     conn.commit()
     conn.close()
     
-    await query.edit_message_text(f"✅ Позиция '{item_name}' успешно удалена!")
+    query.edit_message_text(f"✅ Позиция '{item_name}' успешно удалена!")
 
-# Функции для просмотра остатков
-async def current_stock(update: Update, context: CallbackContext) -> None:
-    conn = sqlite3.connect(DB_NAME)
+def current_stock(update: Update, context: CallbackContext) -> None:
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT c.name, i.name, i.quantity, i.comment
@@ -716,7 +759,7 @@ async def current_stock(update: Update, context: CallbackContext) -> None:
     conn.close()
     
     if not items:
-        await update.message.reply_text("📭 Склад пуст!")
+        update.message.reply_text("📭 Склад пуст!")
         return
     
     response = "📦 Текущие остатки на складе:\n\n"
@@ -731,24 +774,24 @@ async def current_stock(update: Update, context: CallbackContext) -> None:
             response += f" ({comment})"
         response += "\n"
     
-    await update.message.reply_text(response)
+    update.message.reply_text(response)
 
-async def date_stock_start(update: Update, context: CallbackContext) -> int:
+def date_stock_start(update: Update, context: CallbackContext) -> int:
     # Показываем календарь для выбора даты проверки остатков
-    await update.message.reply_text(
+    update.message.reply_text(
         "📅 Выберите дату для проверки остатков:",
         reply_markup=generate_calendar(selection_type="check")
     )
     return CHECK_DATE
 
-async def date_stock_check(update: Update, context: CallbackContext) -> int:
+def date_stock_check(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     if query.data.startswith("nav_check"):
         # Навигация по календарю
         _, _, year, month = query.data.split("_")
-        await query.edit_message_text(
+        query.edit_message_text(
             "📅 Выберите дату для проверки остатков:",
             reply_markup=generate_calendar(int(year), int(month), "check")
         )
@@ -761,23 +804,23 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
         current_date = datetime.now().date()
         
         if target_date < current_date:
-            await query.answer("❌ Дата не может быть в прошлом!", show_alert=True)
+            query.answer("❌ Дата не может быть в прошлом!", show_alert=True)
             return CHECK_DATE
             
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_connection()
         cur = conn.cursor()
         
         cur.execute("""
             SELECT 
                 c.name,
                 i.name,
-                i.quantity - IFNULL(SUM(r.quantity), 0) as available
+                i.quantity - COALESCE(SUM(r.quantity), 0) as available
             FROM items i
             JOIN categories c ON i.category_id = c.id
             LEFT JOIN reservations r ON i.id = r.item_id 
-                AND r.start_date <= ? 
-                AND r.end_date >= ?
-            GROUP BY i.id
+                AND r.start_date <= %s 
+                AND r.end_date >= %s
+            GROUP BY i.id, c.name, i.name, i.quantity
             ORDER BY c.name, i.name
         """, (target_date.isoformat(), target_date.isoformat()))
         
@@ -785,7 +828,7 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
         conn.close()
         
         if not items:
-            await query.edit_message_text(f"📭 На {target_date} нет позиций на складе!")
+            query.edit_message_text(f"📭 На {target_date} нет позиций на складе!")
             return ConversationHandler.END
         
         response = f"📅 Остатки на {target_date}:\n\n"
@@ -798,79 +841,79 @@ async def date_stock_check(update: Update, context: CallbackContext) -> int:
             available = max(0, qty)  # Не показываем отрицательные значения
             response += f"  • {name}: {available}шт\n"
         
-        await query.edit_message_text(response)
+        query.edit_message_text(response)
         return ConversationHandler.END
     
     return CHECK_DATE
 
-# Улучшенные функции для просмотра позиции
-async def view_item_start(update: Update, context: CallbackContext) -> int:
+def view_item_start(update: Update, context: CallbackContext) -> int:
     buttons = [
         [InlineKeyboardButton("📁 Поиск по категориям", callback_data="view_categories")],
         [InlineKeyboardButton("🔍 Поиск по названию", callback_data="view_search")],
     ]
     
-    await update.message.reply_text(
+    update.message.reply_text(
         "🔍 Выберите способ поиска позиции:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return VIEW_CATEGORY_SELECTION
 
-async def view_category_method(update: Update, context: CallbackContext) -> int:
+def view_category_method(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     if query.data == "view_categories":
         # Показываем список категорий
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT id, name FROM categories")
         categories = cur.fetchall()
         conn.close()
         
         if not categories:
-            await query.edit_message_text("❌ В базе нет категорий!")
+            query.edit_message_text("❌ В базе нет категорий!")
             return ConversationHandler.END
         
         buttons = []
         for cat_id, cat_name in categories:
             buttons.append([InlineKeyboardButton(cat_name, callback_data=f"viewcat_{cat_id}")])
         
-        await query.edit_message_text(
+        query.edit_message_text(
             "📁 Выберите категорию:",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return VIEW_CATEGORY_SELECTION
     
     elif query.data == "view_search":
-        await query.edit_message_text(
+        query.edit_message_text(
             "🔍 Введите название позиции для поиска (можно часть названия):"
         )
         return SEARCH_ITEM
 
-async def view_category_selection(update: Update, context: CallbackContext) -> int:
+def view_category_selection(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     category_id = int(query.data.split("_")[1])
     
     # Получаем позиции в выбранной категории
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, i.quantity 
         FROM items i 
-        WHERE i.category_id = ?
+        WHERE i.category_id = %s
         ORDER BY i.name
     """, (category_id,))
     items = cur.fetchall()
     
     # Получаем название категории
-    cur.execute("SELECT name FROM categories WHERE id = ?", (category_id,))
-    category_name = cur.fetchone()[0]
+    cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
+    result = cur.fetchone()
+    category_name = result[0] if result else "Неизвестная категория"
     conn.close()
     
     if not items:
-        await query.edit_message_text(f"❌ В категории '{category_name}' нет позиций!")
+        query.edit_message_text(f"❌ В категории '{category_name}' нет позиций!")
         return ConversationHandler.END
     
     buttons = []
@@ -880,30 +923,30 @@ async def view_category_selection(update: Update, context: CallbackContext) -> i
             callback_data=f"viewitem_{item_id}"
         )])
     
-    await query.edit_message_text(
+    query.edit_message_text(
         f"📁 Категория: {category_name}\n\n"
         "📦 Выберите позицию для просмотра:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return VIEW_ITEM_SELECTION
 
-async def search_item_input(update: Update, context: CallbackContext) -> int:
+def search_item_input(update: Update, context: CallbackContext) -> int:
     search_term = update.message.text
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT i.id, i.name, c.name, i.quantity 
         FROM items i 
         JOIN categories c ON i.category_id = c.id
-        WHERE i.name LIKE ?
+        WHERE i.name LIKE %s
         ORDER BY c.name, i.name
     """, (f"%{search_term}%",))
     items = cur.fetchall()
     conn.close()
     
     if not items:
-        await update.message.reply_text(f"❌ Не найдено позиций по запросу '{search_term}'!")
+        update.message.reply_text(f"❌ Не найдено позиций по запросу '{search_term}'!")
         return ConversationHandler.END
     
     buttons = []
@@ -913,25 +956,25 @@ async def search_item_input(update: Update, context: CallbackContext) -> int:
             callback_data=f"viewitem_{item_id}"
         )])
     
-    await update.message.reply_text(
+    update.message.reply_text(
         f"🔍 Результаты поиска по '{search_term}':\n\n"
         "📦 Выберите позицию для просмотра:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return VIEW_ITEM_SELECTION
 
-async def view_item_selection(update: Update, context: CallbackContext) -> int:
+def view_item_selection(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     # Получаем ID товара из callback_data
     if not query.data.startswith("viewitem_"):
-        await query.edit_message_text("❌ Ошибка при выборе позиции!")
+        query.edit_message_text("❌ Ошибка при выборе позиции!")
         return ConversationHandler.END
         
     item_id = int(query.data.split("_")[1])
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     
     # Получаем информацию о товаре
@@ -939,12 +982,12 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
         SELECT i.name, c.name, i.quantity, i.comment, i.image_path
         FROM items i 
         JOIN categories c ON i.category_id = c.id 
-        WHERE i.id = ?
+        WHERE i.id = %s
     """, (item_id,))
     item_info = cur.fetchone()
     
     if not item_info:
-        await query.edit_message_text("❌ Позиция не найдена!")
+        query.edit_message_text("❌ Позиция не найдена!")
         return ConversationHandler.END
     
     item_name, category_name, quantity, comment, image_path = item_info
@@ -953,7 +996,7 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
     cur.execute("""
         SELECT start_date, end_date, quantity, username, event_name
         FROM reservations 
-        WHERE item_id = ? AND end_date >= date('now')
+        WHERE item_id = %s AND end_date >= date('now')
         ORDER BY start_date
     """, (item_id,))
     reservations = cur.fetchall()
@@ -981,40 +1024,39 @@ async def view_item_selection(update: Update, context: CallbackContext) -> int:
     if image_path and os.path.exists(image_path):
         try:
             with open(image_path, 'rb') as photo:
-                await context.bot.send_photo(
+                context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=photo,
                     caption=message
                 )
-            await query.edit_message_text("✅ Вот информация о позиции:")
+            query.edit_message_text("✅ Вот информация о позиции:")
         except Exception as e:
             logger.error(f"Ошибка при отправке фото: {e}")
-            await query.edit_message_text(f"{message}\n\n❌ Не удалось загрузить фото")
+            query.edit_message_text(f"{message}\n\n❌ Не удалось загрузить фото")
     else:
-        await query.edit_message_text(message)
+        query.edit_message_text(message)
     
     return ConversationHandler.END
 
-# Новая функция для просмотра своих бронирований
-async def my_reservations(update: Update, context: CallbackContext) -> None:
+def my_reservations(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     user_id = user.id
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT r.id, i.name, c.name, r.quantity, r.start_date, r.end_date, r.event_name
         FROM reservations r 
         JOIN items i ON r.item_id = i.id
         JOIN categories c ON i.category_id = c.id
-        WHERE r.user_id = ? AND r.end_date >= date('now')
+        WHERE r.user_id = %s AND r.end_date >= date('now')
         ORDER BY r.end_date
     """, (user_id,))
     reservations = cur.fetchall()
     conn.close()
     
     if not reservations:
-        await update.message.reply_text("📭 У вас нет активных бронирований!")
+        update.message.reply_text("📭 У вас нет активных бронирований!")
         return
     
     response = "📋 Ваши активные бронирования:\n\n"
@@ -1031,19 +1073,10 @@ async def my_reservations(update: Update, context: CallbackContext) -> None:
         response += f"   📅 {start_date} - {end_date}{event_text}\n"
         response += f"   ⏳ Осталось дней: {days_left}\n\n"
     
-    await update.message.reply_text(response)
+    update.message.reply_text(response)
 
-# Функция для отправки напоминаний (для администраторов)
-async def send_reminders(update: Update, context: CallbackContext) -> None:
-    # Проверяем, является ли пользователь администратором
-    # Здесь можно добавить проверку на ID администратора
-    # ADMIN_IDS = [123456789, 987654321]  # Замените на реальные ID
-    
-    # if update.effective_user.id not in ADMIN_IDS:
-    #     await update.message.reply_text("❌ У вас нет прав для этой команды!")
-    #     return
-    
-    conn = sqlite3.connect(DB_NAME)
+def send_reminders(update: Update, context: CallbackContext) -> None:
+    conn = get_connection()
     cur = conn.cursor()
     
     # Находим брони, которые заканчиваются сегодня или уже просрочены
@@ -1069,7 +1102,7 @@ async def send_reminders(update: Update, context: CallbackContext) -> None:
     conn.close()
     
     if not ending_reservations and not overdue_reservations:
-        await update.message.reply_text("✅ Нет бронирований для напоминаний!")
+        update.message.reply_text("✅ Нет бронирований для напоминаний!")
         return
     
     response = "🔔 Напоминания о бронированиях:\n\n"
@@ -1096,17 +1129,10 @@ async def send_reminders(update: Update, context: CallbackContext) -> None:
     
     response += "\n💡 Используйте команду /notify_all для отправки уведомлений всем пользователям."
     
-    await update.message.reply_text(response)
+    update.message.reply_text(response)
 
-# Функция для отправки уведомлений всем пользователям
-async def notify_all_users(update: Update, context: CallbackContext) -> None:
-    # Проверка прав администратора (раскомментируйте и настройте при необходимости)
-    # ADMIN_IDS = [123456789, 987654321]
-    # if update.effective_user.id not in ADMIN_IDS:
-    #     await update.message.reply_text("❌ У вас нет прав для этой команды!")
-    #     return
-    
-    conn = sqlite3.connect(DB_NAME)
+def notify_all_users(update: Update, context: CallbackContext) -> None:
+    conn = get_connection()
     cur = conn.cursor()
     
     # Находим все активные брони
@@ -1125,7 +1151,7 @@ async def notify_all_users(update: Update, context: CallbackContext) -> None:
                 SELECT i.name, r.end_date, r.event_name
                 FROM reservations r 
                 JOIN items i ON r.item_id = i.id
-                WHERE r.user_id = ? AND r.end_date >= date('now')
+                WHERE r.user_id = %s AND r.end_date >= date('now')
                 ORDER BY r.end_date
             """, (user_id,))
             user_reservations = cur.fetchall()
@@ -1146,7 +1172,7 @@ async def notify_all_users(update: Update, context: CallbackContext) -> None:
                 message += "⚠️ Пожалуйста, не забудьте вернуть позиции вовремя!"
                 
                 # Отправляем сообщение пользователю
-                await context.bot.send_message(chat_id=user_id, text=message)
+                context.bot.send_message(chat_id=user_id, text=message)
                 notified_count += 1
                 
         except Exception as e:
@@ -1154,13 +1180,13 @@ async def notify_all_users(update: Update, context: CallbackContext) -> None:
     
     conn.close()
     
-    await update.message.reply_text(f"✅ Уведомления отправлены {notified_count} пользователям!")
+    update.message.reply_text(f"✅ Уведомления отправлены {notified_count} пользователям!")
 
-async def cancel(update: Update, context: CallbackContext) -> int:
-    await update.message.reply_text("❌ Операция отменена.")
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text("❌ Операция отменена.")
     return ConversationHandler.END
 
-async def help_command(update: Update, context: CallbackContext) -> None:
+def help_command(update: Update, context: CallbackContext) -> None:
     help_text = """
 🤖 Бот управления складом
 
@@ -1181,7 +1207,10 @@ async def help_command(update: Update, context: CallbackContext) -> None:
 
 Для начала работы нажмите /start
     """
-    await update.message.reply_text(help_text)
+    update.message.reply_text(help_text)
+
+def error_handler(update: Update, context: CallbackContext) -> None:
+    logger.error(f"Ошибка при обработке обновления: {context.error}")
 
 def main() -> None:
     # Создаем папку для изображений
@@ -1193,42 +1222,37 @@ def main() -> None:
     # ВЫПОЛНЯЕМ МИГРАЦИЮ БАЗЫ ДАННЫХ
     migrate_database()
     
-    # Создаем Application с обработкой ошибок
-    try:
-        application = Application.builder().token(TOKEN).build()
-    except Exception as e:
-        logger.error(f"Ошибка при создании Application: {e}")
-        # Альтернативный способ для старых версий
-        from telegram.ext import Updater
-        application = Application.builder().token(TOKEN).build()
+    # Создаем Updater (для версии 13.x)
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
     # Обработчики диалогов
     add_item_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Добавить позицию$"), add_item_start)],
+        entry_points=[MessageHandler(Filters.regex("^Добавить позицию$"), add_item_start)],
         states={
             CATEGORY_SELECTION: [CallbackQueryHandler(category_selection, pattern="^cat_")],
-            ITEM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, item_name_input)],
-            ITEM_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, item_quantity_input)],
-            ITEM_IMAGE: [MessageHandler(filters.PHOTO, item_image_input)],
-            ITEM_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, item_comment_input)],
+            ITEM_NAME: [MessageHandler(Filters.text & ~Filters.command, item_name_input)],
+            ITEM_QUANTITY: [MessageHandler(Filters.text & ~Filters.command, item_quantity_input)],
+            ITEM_IMAGE: [MessageHandler(Filters.photo, item_image_input)],
+            ITEM_COMMENT: [MessageHandler(Filters.text & ~Filters.command, item_comment_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     reserve_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Забронировать$"), reserve_item_start)],
+        entry_points=[MessageHandler(Filters.regex("^Забронировать$"), reserve_item_start)],
         states={
             RESERVE_ITEM_SELECTION: [CallbackQueryHandler(reserve_item_selection, pattern="^ritem_")],
-            RESERVE_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, reserve_quantity_input)],
+            RESERVE_QUANTITY: [MessageHandler(Filters.text & ~Filters.command, reserve_quantity_input)],
             RESERVE_START_DATE: [CallbackQueryHandler(reserve_start_date_input, pattern="^(date_start|nav_start)")],
             RESERVE_END_DATE: [CallbackQueryHandler(reserve_end_date_input, pattern="^(date_end|nav_end)")],
-            RESERVE_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reserve_event_input)],
+            RESERVE_EVENT: [MessageHandler(Filters.text & ~Filters.command, reserve_event_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     date_check_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Остатки на дату$"), date_stock_start)],
+        entry_points=[MessageHandler(Filters.regex("^Остатки на дату$"), date_stock_start)],
         states={
             CHECK_DATE: [CallbackQueryHandler(date_stock_check, pattern="^(date_check|nav_check)")],
         },
@@ -1236,7 +1260,7 @@ def main() -> None:
     )
 
     view_item_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Просмотр позиции$"), view_item_start)],
+        entry_points=[MessageHandler(Filters.regex("^Просмотр позиции$"), view_item_start)],
         states={
             VIEW_CATEGORY_SELECTION: [
                 CallbackQueryHandler(view_category_method, pattern="^view_categories$"),
@@ -1244,42 +1268,40 @@ def main() -> None:
                 CallbackQueryHandler(view_category_selection, pattern="^viewcat_")
             ],
             VIEW_ITEM_SELECTION: [CallbackQueryHandler(view_item_selection, pattern="^viewitem_")],
-            SEARCH_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_item_input)],
+            SEARCH_ITEM: [MessageHandler(Filters.text & ~Filters.command, search_item_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("reminders", send_reminders))
-    application.add_handler(CommandHandler("notify_all", notify_all_users))
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", help_command))
+    dp.add_handler(CommandHandler("cancel", cancel))
+    dp.add_handler(CommandHandler("reminders", send_reminders))
+    dp.add_handler(CommandHandler("notify_all", notify_all_users))
     
-    application.add_handler(add_item_conv)
-    application.add_handler(reserve_conv)
-    application.add_handler(date_check_conv)
-    application.add_handler(view_item_conv)
+    dp.add_handler(add_item_conv)
+    dp.add_handler(reserve_conv)
+    dp.add_handler(date_check_conv)
+    dp.add_handler(view_item_conv)
     
     # Обработчики callback-запросов (регистрируем отдельно)
-    application.add_handler(CallbackQueryHandler(return_selection, pattern="^ret_"))
-    application.add_handler(CallbackQueryHandler(delete_selection, pattern="^del_"))
+    dp.add_handler(CallbackQueryHandler(return_selection, pattern="^ret_"))
+    dp.add_handler(CallbackQueryHandler(delete_selection, pattern="^del_"))
     
     # Обработчики кнопок
-    application.add_handler(MessageHandler(filters.Regex("^Вернуть бронь$"), return_reservation))
-    application.add_handler(MessageHandler(filters.Regex("^Удалить позицию$"), delete_item))
-    application.add_handler(MessageHandler(filters.Regex("^Текущие остатки$"), current_stock))
-    application.add_handler(MessageHandler(filters.Regex("^Мои бронирования$"), my_reservations))
+    dp.add_handler(MessageHandler(Filters.regex("^Вернуть бронь$"), return_reservation))
+    dp.add_handler(MessageHandler(Filters.regex("^Удалить позицию$"), delete_item))
+    dp.add_handler(MessageHandler(Filters.regex("^Текущие остатки$"), current_stock))
+    dp.add_handler(MessageHandler(Filters.regex("^Мои бронирования$"), my_reservations))
 
     # Добавляем обработчик ошибок
-    async def error_handler(update: Update, context: CallbackContext) -> None:
-        logger.error(f"Ошибка при обработке обновления: {context.error}")
-        
-    application.add_error_handler(error_handler)
+    dp.add_error_handler(error_handler)
 
     # Запуск бота
     logger.info("Бот запущен...")
-    application.run_polling()
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
