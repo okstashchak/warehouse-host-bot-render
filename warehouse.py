@@ -1193,8 +1193,14 @@ def main() -> None:
     # ВЫПОЛНЯЕМ МИГРАЦИЮ БАЗЫ ДАННЫХ
     migrate_database()
     
-    # Создаем Application
-    application = Application.builder().token(TOKEN).build()
+    # Создаем Application с обработкой ошибок
+    try:
+        application = Application.builder().token(TOKEN).build()
+    except Exception as e:
+        logger.error(f"Ошибка при создании Application: {e}")
+        # Альтернативный способ для старых версий
+        from telegram.ext import Updater
+        application = Application.builder().token(TOKEN).build()
 
     # Обработчики диалогов
     add_item_conv = ConversationHandler(
